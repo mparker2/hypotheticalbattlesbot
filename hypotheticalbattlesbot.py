@@ -1,6 +1,7 @@
 import os
 import time
 import re
+from multiprocessing import Process, Queue
 
 import numpy as np
 
@@ -24,7 +25,8 @@ CORPUS_FN = 'whowouldwin_questions.cleaned.txt'
 WEIGHTS_FN = 'whowouldwin190618.h5'
 TEMP_RANGE = (0.75, 1)
 MAX_LEN = 125
-PREFIX="Who"
+PREFIX = "Who"
+N_CHOICES = 4
 
 
 # boring or iffy words that we don't want to tweet!
@@ -56,6 +58,12 @@ def load_corpus():
         for line in f:
             corpus.update(set(nltk.word_tokenize(line.lower())))
     return corpus
+
+
+def load_model():
+    model = textgenrnn()
+    model.load(WEIGHTS_FN)
+    return model
 
 
 detokenize = MosesDetokenizer().detokenize
@@ -145,7 +153,7 @@ def twitter_login():
     return driver
 
 
-def write_poll(driver, question, options):
+def post_to_twitter(driver, question, options):
     tweetbox = WebDriverWait(driver, 10).until(
         EC.presence_of_element_located((By.ID, "tweet-box-home-timeline"))
     )
@@ -176,18 +184,67 @@ def write_poll(driver, question, options):
     return
 
 
-if __name__ == '__main__':
-    whowouldwin = textgenrnn()
-    whowouldwin.load(WEIGHTS_FN)
-    corpus = load_corpus()
+def vote_for_best(queue, corpus):
+    model = load_model()
     while True:
+        print('Started Voting!')
+        suggestions = []
+        for i in range(1, N_CHOICES + 1):
+            question, options = generate_poll(
+                model,
+                corpus,
+                temp=TEMP_RANGE,
+                max_len=MAX_LEN,
+                prefix=PREFIX
+            )
+            print('{}.'.format(i))
+            print(question)
+            for opt in options:
+                print('  # {}'.format(opt))
+            suggestions.append([question, options])
+        while True:
+            choice = input('Choose a question\n')
+            try:
+                choice = int(choice)
+            except ValueError:
+                print('Not a valid choice, sorry')
+                continue
+            if 1 <= choice <= N_CHOICES + 1:
+                break
+            else:
+                print('Number is not in range 1-{}'.format(N_CHOICES))
+        queue.put(suggestions[choice - 1])
+
+
+def write_polls(queue, corpus):
+    model = load_model()
+    # wait for first vote then start posting
+    while queue.empty():
+        time.sleep(1)
+    while True:
+        if queue.empty():
+            question, opts = generate_poll(
+                model,
+                corpus,
+                temp=TEMP_RANGE,
+                max_len=MAX_LEN,
+                prefix=PREFIX
+            )
+        else:
+            question, opts = queue.get()
         driver = twitter_login()
-        question, opts = generate_poll(whowouldwin,
-                                       corpus,
-                                       temp=TEMP_RANGE,
-                                       max_len=MAX_LEN,
-                                       prefix=PREFIX)
-        write_poll(driver, question, opts)
+        post_to_twitter(driver, question, opts)
         driver.refresh()
         driver.quit()
         time.sleep(60 * SLEEP_MINS)
+
+
+if __name__ == '__main__':
+    corpus = load_corpus()
+    queue = Queue(maxsize=1000)
+    writing = Process(target=write_polls,
+                      args=(queue, corpus))
+    writing.daemon = True
+    writing.start()
+    vote_for_best(queue, corpus)
+    writing.join()
